@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
+mod supervisor_logging;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -52,6 +53,7 @@ use codex_app_server_protocol::TurnInterruptResponse;
 use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnStartedNotification;
+use codex_app_server_protocol::TurnStatus;
 use codex_arg0::Arg0DispatchPaths;
 use codex_cloud_requirements::cloud_requirements_loader_for_storage;
 use codex_config::ConfigLoadError;
@@ -137,8 +139,10 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use supports_color::Stream;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tracing::Instrument;
 use tracing::error;
 use tracing::field;
@@ -151,6 +155,7 @@ use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::EventProcessor;
+use crate::supervisor_logging::FileSessionLogger;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
@@ -201,6 +206,11 @@ struct ExecRunArgs {
     images: Vec<PathBuf>,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
+    log_session_dir: Option<PathBuf>,
+    instance_id: Option<String>,
+    wait_for_followup: bool,
+    followup_timeout_seconds: u64,
+    mode: Option<String>,
     model_provider: Option<String>,
     oss: bool,
     output_schema_path: Option<PathBuf>,
@@ -238,12 +248,24 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         removed_full_auto,
         color,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
         config_overrides,
     } = cli;
     let shared = shared.into_inner();
+
+    if wait_for_followup && log_session_dir.is_none() {
+        return Err(anyhow::anyhow!(
+            "--wait-for-followup requires --log-session-dir so followup_input.json has a stable location"
+        ));
+    }
+
     let SharedCliOptions {
         images,
         model: model_cli_arg,
@@ -411,7 +433,7 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         main_execve_wrapper_exe: arg0_paths.main_execve_wrapper_exe.clone(),
         zsh_path: None,
         base_instructions: None,
-        developer_instructions: None,
+        developer_instructions: mode.as_ref().map(|mode| format!("Supervisor mode: {mode}")),
         personality: None,
         compact_prompt: None,
         include_apply_patch_tool: None,
@@ -532,6 +554,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         images,
         json_mode,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         model_provider,
         oss,
         output_schema_path,
@@ -553,6 +580,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         images,
         json_mode,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         model_provider,
         oss,
         output_schema_path,
@@ -569,6 +601,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             last_message_file.clone(),
         )),
     };
+    let mut file_logger = FileSessionLogger::maybe_new(
+        log_session_dir,
+        instance_id,
+        config.model.clone(),
+        mode.clone(),
+    )?;
     if oss {
         // We're in the oss section, so provider_id should be Some
         // Let's handle None case gracefully though just in case
@@ -730,10 +768,20 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
+    if let Some(logger) = file_logger.as_mut()
+        && let Err(err) = logger.log_initial(&config, &prompt_summary, &session_configured)
+    {
+        warn!("failed to write supervisor initial log: {err}");
+    }
     if !json_mode
         && let Some(message) =
             codex_core::config::system_bwrap_warning(config.permissions.permission_profile.get())
     {
+        if let Some(logger) = file_logger.as_mut()
+            && let Err(err) = logger.log_warning("system_bwrap_warning", &message)
+        {
+            warn!("failed to write supervisor warning log: {err}");
+        }
         event_processor.process_warning(message);
     }
 
@@ -747,7 +795,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let task_id = match initial_operation {
+    let mut task_id = match initial_operation {
         InitialOperation::UserTurn {
             items,
             output_schema,
@@ -810,6 +858,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     };
     exec_span.record("turn.id", task_id.as_str());
+    if let Some(logger) = file_logger.as_mut()
+        && let Err(err) = logger.write_status("running")
+    {
+        warn!("failed to write supervisor status: {err}");
+    }
 
     // Run the loop until the task is complete.
     // Track whether a fatal error was reported by the server so we can
@@ -885,9 +938,120 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     &primary_thread_id_for_requests,
                     &task_id,
                 ) {
+                    if let Some(logger) = file_logger.as_mut()
+                        && let Err(err) = logger.process_server_notification(&notification)
+                    {
+                        warn!("failed to write supervisor event log: {err}");
+                    }
+                    let completed_status = match &notification {
+                        ServerNotification::TurnCompleted(payload) => {
+                            Some(payload.turn.status.clone())
+                        }
+                        _ => None,
+                    };
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
+                            if wait_for_followup
+                                && matches!(completed_status, Some(TurnStatus::Completed))
+                            {
+                                if let Some(logger) = file_logger.as_mut()
+                                    && let Err(err) = logger.write_status("waiting_for_followup")
+                                {
+                                    warn!("failed to write supervisor waiting status: {err}");
+                                }
+                                match wait_for_followup_message(
+                                    file_logger.as_ref(),
+                                    Duration::from_secs(followup_timeout_seconds),
+                                )
+                                .await
+                                {
+                                    FollowupAction::Message(message) => {
+                                        if let Some(logger) = file_logger.as_mut()
+                                            && let Err(err) = logger.log_followup(&message)
+                                        {
+                                            warn!("failed to write supervisor followup log: {err}");
+                                        }
+                                        let response: TurnStartResponse =
+                                            send_request_with_response(
+                                                &client,
+                                                ClientRequest::TurnStart {
+                                                    request_id: request_ids.next(),
+                                                    params: TurnStartParams {
+                                                        thread_id: primary_thread_id_for_requests
+                                                            .clone(),
+                                                        input: vec![
+                                                            UserInput::Text {
+                                                                text: message.clone(),
+                                                                text_elements: Vec::new(),
+                                                            }
+                                                            .into(),
+                                                        ],
+                                                        responsesapi_client_metadata: None,
+                                                        environments: None,
+                                                        cwd: Some(config.cwd.to_path_buf()),
+                                                        approval_policy: Some(
+                                                            default_approval_policy.into(),
+                                                        ),
+                                                        approvals_reviewer: None,
+                                                        sandbox_policy: None,
+                                                        permissions: None,
+                                                        model: None,
+                                                        service_tier: None,
+                                                        effort: default_effort,
+                                                        summary: None,
+                                                        personality: None,
+                                                        output_schema: None,
+                                                        collaboration_mode: None,
+                                                    },
+                                                },
+                                                "turn/start",
+                                            )
+                                            .await
+                                            .map_err(anyhow::Error::msg)?;
+                                        task_id = response.turn.id;
+                                        exec_span.record("turn.id", task_id.as_str());
+                                        if let Some(logger) = file_logger.as_mut()
+                                            && let Err(err) = logger.write_status("running")
+                                        {
+                                            warn!(
+                                                "failed to write supervisor running status: {err}"
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    FollowupAction::Terminate => {
+                                        if let Some(logger) = file_logger.as_mut()
+                                            && let Err(err) = logger.write_final_result("completed")
+                                        {
+                                            warn!("failed to write supervisor final result: {err}");
+                                        }
+                                    }
+                                    FollowupAction::Timeout => {
+                                        if let Some(logger) = file_logger.as_mut()
+                                            && let Err(err) = logger.log_warning(
+                                                "followup_timeout",
+                                                "followup wait timed out; exiting worker",
+                                            )
+                                        {
+                                            warn!("failed to write supervisor timeout log: {err}");
+                                        }
+                                        if let Some(logger) = file_logger.as_mut()
+                                            && let Err(err) = logger.write_final_result("completed")
+                                        {
+                                            warn!("failed to write supervisor final result: {err}");
+                                        }
+                                    }
+                                }
+                            } else if let Some(logger) = file_logger.as_mut()
+                                && let Err(err) = logger.write_final_result(if error_seen {
+                                    "failed"
+                                } else {
+                                    "completed"
+                                })
+                            {
+                                warn!("failed to write supervisor final result: {err}");
+                            }
                             if let Err(err) = request_shutdown(
                                 &client,
                                 &mut request_ids,
@@ -905,6 +1069,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             InProcessServerEvent::Lagged { skipped } => {
                 let message = lagged_event_warning_message(skipped);
                 warn!("{message}");
+                if let Some(logger) = file_logger.as_mut()
+                    && let Err(err) = logger.log_warning("lagged", &message)
+                {
+                    warn!("failed to write supervisor lagged warning: {err}");
+                }
                 event_processor.process_warning(message);
             }
         }
@@ -914,11 +1083,46 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         warn!("in-process app-server shutdown failed: {err}");
     }
     event_processor.print_final_output();
+    if let Some(logger) = file_logger.as_mut()
+        && let Err(err) = logger.write_final_result(if error_seen { "failed" } else { "completed" })
+    {
+        warn!("failed to write supervisor final result: {err}");
+    }
     if error_seen {
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+enum FollowupAction {
+    Message(String),
+    Terminate,
+    Timeout,
+}
+
+async fn wait_for_followup_message(
+    logger: Option<&FileSessionLogger>,
+    timeout: Duration,
+) -> FollowupAction {
+    let Some(logger) = logger else {
+        return FollowupAction::Terminate;
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return FollowupAction::Timeout;
+        }
+        match logger.take_followup_input() {
+            Ok(Some(action)) => return action,
+            Ok(None) => {}
+            Err(err) => {
+                warn!("failed to read supervisor followup input: {err}");
+                return FollowupAction::Terminate;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn thread_start_params_from_config(config: &Config) -> ThreadStartParams {
