@@ -74,6 +74,31 @@ pub struct Cli {
     )]
     pub last_message_file: Option<PathBuf>,
 
+    /// Directory where supervisor-readable worker logs should be written.
+    #[arg(long = "log-session-dir", value_name = "DIR", global = true)]
+    pub log_session_dir: Option<PathBuf>,
+
+    /// Stable worker identifier to include in supervisor-readable logs.
+    #[arg(long = "instance-id", value_name = "ID", global = true)]
+    pub instance_id: Option<String>,
+
+    /// Wait for followup_input.json after each completed turn.
+    #[arg(long = "wait-for-followup", global = true, default_value_t = false)]
+    pub wait_for_followup: bool,
+
+    /// Maximum time to wait for followup_input.json before exiting cleanly.
+    #[arg(
+        long = "followup-timeout-seconds",
+        value_name = "SECONDS",
+        global = true,
+        default_value_t = 3600
+    )]
+    pub followup_timeout_seconds: u64,
+
+    /// Optional specialist mode label. For now this is logged and prepended to the prompt.
+    #[arg(long = "mode", value_name = "MODE", global = true)]
+    pub mode: Option<String>,
+
     /// Initial instructions for the agent. If not provided as an argument (or
     /// if `-` is used), instructions are read from stdin. If stdin is piped and
     /// a prompt is also provided, stdin is appended as a `<stdin>` block.

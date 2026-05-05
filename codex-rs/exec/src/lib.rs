@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub(crate) mod event_processor_with_jsonl_output;
 pub(crate) mod exec_events;
+mod supervisor_logger;
 
 pub use cli::Cli;
 pub use cli::Command;
@@ -138,6 +139,7 @@ use std::io::IsTerminal;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use supports_color::Stream;
 use tokio::sync::mpsc;
 use tracing::Instrument;
@@ -152,6 +154,9 @@ use uuid::Uuid;
 
 use crate::cli::Command as ExecCommand;
 use crate::event_processor::EventProcessor;
+use crate::supervisor_logger::FollowupDecision;
+use crate::supervisor_logger::SupervisorLogger;
+use crate::supervisor_logger::wait_for_followup as wait_for_supervisor_followup;
 
 const DEFAULT_ANALYTICS_ENABLED: bool = true;
 
@@ -203,6 +208,11 @@ struct ExecRunArgs {
     images: Vec<PathBuf>,
     json_mode: bool,
     last_message_file: Option<PathBuf>,
+    log_session_dir: Option<PathBuf>,
+    instance_id: Option<String>,
+    wait_for_followup: bool,
+    followup_timeout_seconds: u64,
+    mode: Option<String>,
     model_provider: Option<String>,
     oss: bool,
     output_schema_path: Option<PathBuf>,
@@ -240,6 +250,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         removed_full_auto,
         color,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         json: json_mode,
         prompt,
         output_schema: output_schema_path,
@@ -537,6 +552,11 @@ pub async fn run_main(cli: Cli, arg0_paths: Arg0DispatchPaths) -> anyhow::Result
         images,
         json_mode,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         model_provider,
         oss,
         output_schema_path,
@@ -559,6 +579,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         images,
         json_mode,
         last_message_file,
+        log_session_dir,
+        instance_id,
+        wait_for_followup,
+        followup_timeout_seconds,
+        mode,
         model_provider,
         oss,
         output_schema_path,
@@ -614,7 +639,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     }
                 })
                 .or(root_prompt);
-            let prompt_text = resolve_prompt(prompt_arg);
+            let prompt_text = apply_mode_to_prompt(mode.as_deref(), resolve_prompt(prompt_arg));
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
                 .chain(args.images.iter().cloned())
@@ -635,7 +660,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             )
         }
         (None, root_prompt, imgs) => {
-            let prompt_text = resolve_root_prompt(root_prompt);
+            let prompt_text =
+                apply_mode_to_prompt(mode.as_deref(), resolve_root_prompt(root_prompt));
             let mut items: Vec<UserInput> = imgs
                 .into_iter()
                 .map(|path| UserInput::LocalImage { path })
@@ -737,6 +763,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     // Print the effective configuration and initial request so users can see what Codex
     // is using.
+    let mut supervisor_logger = match log_session_dir {
+        Some(log_session_dir) => {
+            let instance_id = instance_id.unwrap_or_else(|| "codex-worker".to_string());
+            let mut logger = SupervisorLogger::new(
+                log_session_dir,
+                instance_id,
+                mode.clone(),
+                session_configured.model.clone(),
+            )?;
+            logger.log_initial_prompt(&config, &prompt_summary, &session_configured)?;
+            Some(logger)
+        }
+        None => None,
+    };
+
     event_processor.print_config_summary(&config, &prompt_summary, &session_configured);
     if !json_mode
         && let Some(message) =
@@ -755,35 +796,20 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
-    let task_id = match initial_operation {
+    let mut task_id = match initial_operation {
         InitialOperation::UserTurn {
             items,
             output_schema,
         } => {
-            let response: TurnStartResponse = send_request_with_response(
+            let response = start_user_turn(
                 &client,
-                ClientRequest::TurnStart {
-                    request_id: request_ids.next(),
-                    params: TurnStartParams {
-                        thread_id: primary_thread_id_for_span.clone(),
-                        input: items.into_iter().map(Into::into).collect(),
-                        responsesapi_client_metadata: None,
-                        environments: None,
-                        cwd: Some(default_cwd),
-                        approval_policy: Some(default_approval_policy.into()),
-                        approvals_reviewer: None,
-                        sandbox_policy: None,
-                        permissions: None,
-                        model: None,
-                        service_tier: None,
-                        effort: default_effort,
-                        summary: None,
-                        personality: None,
-                        output_schema,
-                        collaboration_mode: None,
-                    },
-                },
-                "turn/start",
+                &mut request_ids,
+                primary_thread_id_for_span.clone(),
+                items,
+                default_cwd.clone(),
+                default_approval_policy,
+                default_effort,
+                output_schema,
             )
             .await
             .map_err(anyhow::Error::msg)?;
@@ -893,9 +919,91 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                     &primary_thread_id_for_requests,
                     &task_id,
                 ) {
+                    let completed_turn_status =
+                        if let ServerNotification::TurnCompleted(payload) = &notification {
+                            Some(payload.turn.status.clone())
+                        } else {
+                            None
+                        };
+
+                    if let Some(logger) = supervisor_logger.as_mut()
+                        && let Err(err) = logger.process_notification(&notification)
+                    {
+                        warn!("failed to write supervisor log: {err}");
+                    }
+
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
+                            if wait_for_followup
+                                && matches!(
+                                    completed_turn_status,
+                                    Some(codex_app_server_protocol::TurnStatus::Completed)
+                                )
+                                && let Some(logger) = supervisor_logger.as_mut()
+                            {
+                                match wait_for_supervisor_followup(
+                                    logger,
+                                    Duration::from_secs(followup_timeout_seconds),
+                                )
+                                .await
+                                {
+                                    Ok(FollowupDecision::Continue(message)) => {
+                                        let items = vec![UserInput::Text {
+                                            text: message.clone(),
+                                            text_elements: Vec::new(),
+                                        }];
+                                        if let Err(err) = logger.record_user_message(message) {
+                                            warn!("failed to write supervisor followup log: {err}");
+                                        }
+                                        if let Err(err) = logger.mark_running() {
+                                            warn!(
+                                                "failed to write supervisor running status: {err}"
+                                            );
+                                        }
+                                        let response = start_user_turn(
+                                            &client,
+                                            &mut request_ids,
+                                            primary_thread_id_for_requests.clone(),
+                                            items,
+                                            default_cwd.clone(),
+                                            default_approval_policy,
+                                            default_effort,
+                                            None,
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::msg)?;
+                                        task_id = response.turn.id;
+                                        exec_span.record("turn.id", task_id.as_str());
+                                        continue;
+                                    }
+                                    Ok(FollowupDecision::Terminate | FollowupDecision::Timeout) => {
+                                        if let Err(err) = logger.mark_completed() {
+                                            warn!("failed to write supervisor final result: {err}");
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            "failed while waiting for supervisor followup: {err}"
+                                        );
+                                        if let Err(write_err) = logger.mark_failed() {
+                                            warn!(
+                                                "failed to write supervisor failure result: {write_err}"
+                                            );
+                                        }
+                                        error_seen = true;
+                                    }
+                                }
+                            } else if let Some(logger) = supervisor_logger.as_mut() {
+                                let result = if error_seen {
+                                    logger.mark_failed()
+                                } else {
+                                    logger.mark_completed()
+                                };
+                                if let Err(err) = result {
+                                    warn!("failed to write supervisor final result: {err}");
+                                }
+                            }
                             if let Err(err) = request_shutdown(
                                 &client,
                                 &mut request_ids,
@@ -1051,6 +1159,51 @@ where
             format!("{method}: {err}")
         }
     })
+}
+
+async fn start_user_turn(
+    client: &InProcessAppServerClient,
+    request_ids: &mut RequestIdSequencer,
+    thread_id: String,
+    items: Vec<UserInput>,
+    cwd: PathBuf,
+    approval_policy: AskForApproval,
+    effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    output_schema: Option<Value>,
+) -> Result<TurnStartResponse, String> {
+    send_request_with_response(
+        client,
+        ClientRequest::TurnStart {
+            request_id: request_ids.next(),
+            params: TurnStartParams {
+                thread_id,
+                input: items.into_iter().map(Into::into).collect(),
+                responsesapi_client_metadata: None,
+                environments: None,
+                cwd: Some(cwd),
+                approval_policy: Some(approval_policy.into()),
+                approvals_reviewer: None,
+                sandbox_policy: None,
+                permissions: None,
+                model: None,
+                service_tier: None,
+                effort,
+                summary: None,
+                personality: None,
+                output_schema,
+                collaboration_mode: None,
+            },
+        },
+        "turn/start",
+    )
+    .await
+}
+
+fn apply_mode_to_prompt(mode: Option<&str>, prompt: String) -> String {
+    match mode.map(str::trim).filter(|mode| !mode.is_empty()) {
+        Some(mode) => format!("Specialist mode: {mode}\n\n{prompt}"),
+        None => prompt,
+    }
 }
 
 fn session_configured_from_thread_start_response(
